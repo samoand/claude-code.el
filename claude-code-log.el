@@ -287,6 +287,17 @@ CONVERSATION is the buffer content string."
                                             conversation)
                                     t)))
 
+(defun claude-code-log--write-continuation-marker (project transaction-id)
+  "Write transaction reopened marker.
+PROJECT is the project name.
+TRANSACTION-ID is the transaction ID."
+  (let* ((log-file (claude-code-log--get-log-file project transaction-id 'transactional))
+         (timestamp (claude-code-log--timestamp))
+         (content (format "\n;;; TRANSACTION-REOPENED: %s | %s\n;;; Reason: User continuation\n\n"
+                          transaction-id
+                          timestamp)))
+    (claude-code-log--write-to-file log-file content t)))
+
 ;;;; Git Artifact Functions
 
 (defun claude-code-log--get-artifacts (baseline-dirty-files)
@@ -337,6 +348,64 @@ ARTIFACTS is list of file paths."
         (claude-code-log--write-to-file artifact-file diff)
         (push artifact-file artifact-files)))
     (nreverse artifact-files)))
+
+;;;; Transaction History Functions
+
+(defun claude-code-log--find-last-transaction (project buffer-name)
+  "Find the most recent transaction ID for PROJECT in BUFFER-NAME.
+Returns transaction-id or nil if none found."
+  (let* ((version-dir (claude-code-log--get-version-dir project))
+         (raw-dir (expand-file-name "raw-transactional" version-dir))
+         (log-files (when (file-directory-p raw-dir)
+                      (directory-files raw-dir t "^txn-.*\\.log$")))
+         (last-txn nil)
+         (last-time 0))
+    ;; Find most recent transaction for this buffer
+    (dolist (log-file log-files)
+      (with-temp-buffer
+        (insert-file-contents log-file)
+        (goto-char (point-min))
+        (when (re-search-forward
+               (format "^;;; TRANSACTION-START: \\(txn-[^ ]+\\) .* buffer: %s$"
+                       (regexp-quote buffer-name))
+               nil t)
+          (let* ((txn-id (match-string 1))
+                 (file-time (file-attribute-modification-time
+                             (file-attributes log-file))))
+            (when (time-less-p last-time file-time)
+              (setq last-txn txn-id
+                    last-time file-time))))))
+    last-txn))
+
+(defun claude-code-log--read-transaction-metadata (project transaction-id)
+  "Read metadata for TRANSACTION-ID in PROJECT.
+Returns alist from JSON metadata file, or nil if not found."
+  (let* ((version-dir (claude-code-log--get-version-dir project))
+         (metadata-file (expand-file-name
+                         (format "%s.json" transaction-id)
+                         (expand-file-name "metadata" version-dir))))
+    (when (file-exists-p metadata-file)
+      (json-read-file metadata-file))))
+
+(defun claude-code-log--remove-transaction-end (project transaction-id)
+  "Remove TRANSACTION-END marker from TRANSACTION-ID log.
+PROJECT is the project name.
+TRANSACTION-ID is the transaction ID to reopen."
+  (let* ((log-file (claude-code-log--get-log-file project transaction-id 'transactional))
+         (backup-file (concat log-file ".backup")))
+    (when (file-exists-p log-file)
+      ;; Create backup
+      (copy-file log-file backup-file t)
+      ;; Read file and remove TRANSACTION-END
+      (with-temp-buffer
+        (insert-file-contents log-file)
+        (goto-char (point-max))
+        ;; Search backwards for TRANSACTION-END marker
+        (when (re-search-backward
+               (format "^;;; TRANSACTION-END: %s" (regexp-quote transaction-id))
+               nil t)
+          (delete-region (line-beginning-position) (point-max))
+          (write-region (point-min) (point-max) log-file nil 'silent))))))
 
 ;;;; Metadata Functions
 
@@ -560,6 +629,56 @@ The data is written to the corpus directory for later curation."
 
       (message "Transaction committed: %s (%d artifacts, %dm%ds)"
                txn-id artifact-count (/ duration 60) (mod duration 60)))))
+
+;;;###autoload
+(defun claude-code-reopen ()
+  "Reopen the most recent transaction in this buffer.
+
+This command allows you to continue a previously committed transaction.
+It removes the TRANSACTION-END marker and restores the transaction state,
+so you can add more conversation turns before committing again.
+
+Only the most recent transaction for this buffer can be reopened.
+The transaction continues with the same ID, creating a multi-session
+conversation log."
+  (interactive)
+  (unless (derived-mode-p 'eat-mode 'vterm-mode)
+    (error "Must be called from a Claude Code buffer"))
+
+  (when claude-code-log--transaction-id
+    (error "Already in a transaction: %s. Commit first before reopening"
+           claude-code-log--transaction-id))
+
+  ;; Find last transaction for this buffer
+  (let* ((project (claude-code-log--get-project-name))
+         (last-txn-id (claude-code-log--find-last-transaction project (buffer-name))))
+
+    (unless last-txn-id
+      (error "No previous transaction found in this buffer"))
+
+    ;; Read existing metadata
+    (let ((metadata (claude-code-log--read-transaction-metadata project last-txn-id)))
+      (unless metadata
+        (error "Could not read metadata for transaction %s" last-txn-id))
+
+      ;; Remove TRANSACTION-END marker from log file
+      (claude-code-log--remove-transaction-end project last-txn-id)
+
+      ;; Restore transaction state
+      (setq claude-code-log--transaction-id last-txn-id
+            claude-code-log--baseline-sha (alist-get 'git_baseline_sha metadata)
+            claude-code-log--baseline-timestamp (float-time) ; Reset start time to now
+            claude-code-log--baseline-buffer-point (point-max)
+            claude-code-log--baseline-dirty-files (when claude-code-log--artifact-tracking
+                                                    (claude-code-log--get-dirty-files))
+            claude-code-log--tool-uses (append (alist-get 'tool_uses metadata) nil)
+            claude-code-log--command-count (alist-get 'commands_count metadata)
+            claude-code-log--artifact-tracking (not (null (alist-get 'git_baseline_sha metadata))))
+
+      ;; Write continuation marker
+      (claude-code-log--write-continuation-marker project last-txn-id)
+
+      (message "Reopened transaction: %s (continue working, commit when done)" last-txn-id))))
 
 ;;;; Event Hook Integration
 
