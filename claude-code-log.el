@@ -106,6 +106,24 @@ Use `claude-code-log' for user-facing control.")
 (defvar-local claude-code-log--waiting-for-finish nil
   "Non-nil when waiting for Claude to finish responding.")
 
+(defvar-local claude-code-log--description nil
+  "User-provided description for current transaction.")
+
+(defvar-local claude-code-log--parent-transaction nil
+  "Parent transaction ID for current transaction.")
+
+(defvar-local claude-code-log--relationship-type nil
+  "Relationship type to parent (parent-child, follows, related).")
+
+(defvar-local claude-code-log--related-transactions nil
+  "List of related transaction IDs.")
+
+(defvar-local claude-code-log--first-command nil
+  "First command sent in transaction (for auto description).")
+
+(defvar claude-code-log--parent-history nil
+  "History for parent transaction selection.")
+
 ;;;; Utility Functions
 
 (defun claude-code-log--timestamp ()
@@ -407,6 +425,100 @@ TRANSACTION-ID is the transaction ID to reopen."
           (delete-region (line-beginning-position) (point-max))
           (write-region (point-min) (point-max) log-file nil 'silent))))))
 
+;;;; Description and Linking Functions
+
+(defun claude-code-log--generate-default-description ()
+  "Generate smart default description for transaction.
+Uses first command if short, truncates if long, or falls back to artifact summary."
+  (let* ((first-command claude-code-log--first-command)
+         (artifacts (when claude-code-log--artifact-tracking
+                      (claude-code-log--get-artifacts
+                       claude-code-log--baseline-dirty-files)))
+         (artifact-count (length artifacts)))
+    (cond
+     ;; If first command is short and descriptive, use it
+     ((and first-command (< (length first-command) 60))
+      first-command)
+
+     ;; If first command is long, truncate
+     ((and first-command (>= (length first-command) 60))
+      (concat (substring first-command 0 57) "..."))
+
+     ;; Fallback: artifact summary
+     ((> artifact-count 0)
+      (format "Modified %d file%s: %s"
+              artifact-count
+              (if (= artifact-count 1) "" "s")
+              (string-join (mapcar #'file-name-nondirectory
+                                   (seq-take artifacts 3))
+                           ", ")))
+
+     ;; Last resort: empty
+     (t ""))))
+
+(defun claude-code-log--transaction-to-consult-candidate (metadata)
+  "Convert transaction METADATA to consult candidate.
+Returns (display-string . transaction-id)."
+  (let* ((txn-id (alist-get 'transaction_id metadata))
+         (description (or (alist-get 'description metadata) ""))
+         (date (or (alist-get 'start_time metadata) ""))
+         (artifacts (or (alist-get 'artifacts metadata) []))
+         (project (or (alist-get 'project metadata) ""))
+         ;; Format: [date] description (project, N files)
+         (date-str (if (> (length date) 10)
+                       (substring date 0 10)
+                     date))
+         (display (format "%s  %s  (%s, %d files)"
+                          (propertize date-str 'face 'font-lock-comment-face)
+                          (if (string-empty-p description)
+                              (propertize "No description" 'face 'shadow)
+                            description)
+                          (propertize project 'face 'font-lock-keyword-face)
+                          (length artifacts))))
+    (cons display txn-id)))
+
+(defun claude-code-log--get-transaction-candidates (&optional project limit)
+  "Get transaction candidates for completion.
+Optional PROJECT filters to specific project (default: current).
+Optional LIMIT restricts to N most recent transactions (default: all)."
+  (let* ((project (or project (claude-code-log--get-project-name)))
+         (version-dir (claude-code-log--get-version-dir project))
+         (metadata-dir (expand-file-name "metadata" version-dir))
+         (files (when (file-directory-p metadata-dir)
+                  (directory-files metadata-dir t "^txn-.*\\.json$")))
+         (candidates '()))
+    (dolist (file files)
+      (condition-case nil
+          (let* ((metadata (json-read-file file))
+                 (candidate (claude-code-log--transaction-to-consult-candidate metadata)))
+            (push candidate candidates))
+        (error nil))) ; Skip malformed JSON files
+    ;; Sort by date (most recent first) and optionally limit
+    (let ((sorted (sort candidates
+                        (lambda (a b)
+                          (string> (car a) (car b))))))
+      (if limit
+          (seq-take sorted limit)
+        sorted))))
+
+(defun claude-code-log--get-all-transaction-candidates (&optional limit)
+  "Get transaction candidates from ALL projects.
+Optional LIMIT restricts to N most recent transactions per project."
+  (let ((candidates '())
+        (projects-dir (expand-file-name "projects" claude-code-log-corpus-dir)))
+    (when (file-directory-p projects-dir)
+      (dolist (project-dir (directory-files projects-dir t "^[^.]"))
+        (when (file-directory-p project-dir)
+          (let ((project-name (file-name-nondirectory project-dir)))
+            (setq candidates
+                  (append candidates
+                          (claude-code-log--get-transaction-candidates
+                           project-name limit)))))))
+    ;; Sort all candidates by date
+    (sort candidates
+          (lambda (a b)
+            (string> (car a) (car b))))))
+
 ;;;; Metadata Functions
 
 (defun claude-code-log--write-transaction-metadata (project transaction-id data)
@@ -576,6 +688,15 @@ The data is written to the corpus directory for later curation."
     ;; TODO: Wait for Claude to finish if mid-response
     ;; For now, just capture current state
 
+    ;; Prompt for description with smart default
+    (let* ((default-desc (claude-code-log--generate-default-description))
+           (prompt-text (if (string-empty-p default-desc)
+                           "Transaction description: "
+                         (format "Transaction description (default: %s): "
+                                 (truncate-string-to-width default-desc 50))))
+           (description (read-string prompt-text nil nil default-desc)))
+      (setq claude-code-log--description description))
+
     ;; Capture conversation snapshot
     (let ((conversation (buffer-substring-no-properties
                          claude-code-log--baseline-buffer-point
@@ -600,6 +721,9 @@ The data is written to the corpus directory for later curation."
          (project . ,project)
          (version . "v1")
          (buffer . ,(buffer-name))
+         (description . ,(or claude-code-log--description ""))
+         (auto_generated_description . ,(if claude-code-log--description nil t))
+         (first_command . ,(or claude-code-log--first-command ""))
          (start_time . ,(format-time-string "%Y-%m-%dT%H:%M:%S"
                                              (seconds-to-time start-time)))
          (end_time . ,(format-time-string "%Y-%m-%dT%H:%M:%S"
@@ -610,6 +734,9 @@ The data is written to the corpus directory for later curation."
          (commands_count . ,claude-code-log--command-count)
          (tool_uses . ,(vconcat claude-code-log--tool-uses))
          (artifacts . ,(vconcat artifacts))
+         (parent_transaction . ,(or claude-code-log--parent-transaction :null))
+         (relationship_type . ,(or claude-code-log--relationship-type :null))
+         (related_transactions . ,(vconcat (or claude-code-log--related-transactions [])))
          (raw_log . ,(file-relative-name
                       (claude-code-log--get-log-file project txn-id 'transactional)
                       (claude-code-log--get-version-dir project)))
@@ -625,7 +752,12 @@ The data is written to the corpus directory for later curation."
             claude-code-log--baseline-buffer-point nil
             claude-code-log--baseline-dirty-files nil
             claude-code-log--tool-uses nil
-            claude-code-log--command-count 0)
+            claude-code-log--command-count 0
+            claude-code-log--description nil
+            claude-code-log--parent-transaction nil
+            claude-code-log--relationship-type nil
+            claude-code-log--related-transactions nil
+            claude-code-log--first-command nil)
 
       (message "Transaction committed: %s (%d artifacts, %dm%ds)"
                txn-id artifact-count (/ duration 60) (mod duration 60)))))
@@ -745,10 +877,136 @@ CMD is the command string."
       ;; Increment command counter for transactions
       (when txn-id
         (setq claude-code-log--command-count
-              (1+ claude-code-log--command-count)))))
+              (1+ claude-code-log--command-count))
+        ;; Capture first command for description generation
+        (unless claude-code-log--first-command
+          (setq claude-code-log--first-command cmd)))))
 
   ;; Call original function
   (funcall orig-fun cmd))
+
+;;;; Transaction Linking Commands
+
+;;;###autoload
+(defun claude-code-record-with-parent ()
+  "Start a new transaction with a parent link.
+
+Prompts for a parent transaction from the current project and
+establishes a relationship (parent-child, follows, or related).
+This creates a linked conversation history useful for tracking
+feature evolution and related work."
+  (interactive)
+  (let* ((candidates (claude-code-log--get-transaction-candidates nil 20))
+         (selected (if candidates
+                       (completing-read "Parent transaction: "
+                                       candidates
+                                       nil nil nil
+                                       'claude-code-log--parent-history)
+                     (error "No transactions found in current project")))
+         (parent-id (cdr (assoc selected candidates)))
+         (relationship (completing-read "Relationship: "
+                                       '("parent-child" "follows" "related")
+                                       nil t nil nil "parent-child")))
+
+    ;; Start transaction
+    (claude-code-record)
+
+    ;; Store parent info
+    (setq-local claude-code-log--parent-transaction parent-id
+                claude-code-log--relationship-type relationship)
+
+    (message "Transaction started with parent: %s (%s)" parent-id relationship)))
+
+;;;###autoload
+(defun claude-code-link-to-parent ()
+  "Link current transaction to a parent.
+
+Must be called while in an active transaction. Allows you to
+establish a parent relationship after starting the transaction."
+  (interactive)
+  (unless claude-code-log--transaction-id
+    (error "Not in a transaction. Use `claude-code-record' first"))
+
+  (when claude-code-log--parent-transaction
+    (unless (yes-or-no-p
+             (format "Already linked to parent %s. Replace? "
+                     claude-code-log--parent-transaction))
+      (user-error "Cancelled")))
+
+  (let* ((candidates (claude-code-log--get-transaction-candidates nil 20))
+         (selected (completing-read "Parent transaction: "
+                                   candidates
+                                   nil nil nil
+                                   'claude-code-log--parent-history))
+         (parent-id (cdr (assoc selected candidates)))
+         (relationship (completing-read "Relationship: "
+                                       '("parent-child" "follows" "related")
+                                       nil t nil nil "parent-child")))
+
+    (setq-local claude-code-log--parent-transaction parent-id
+                claude-code-log--relationship-type relationship)
+
+    (message "Linked to parent: %s (%s)" parent-id relationship)))
+
+;;;###autoload
+(defun claude-code-add-related ()
+  "Add a related transaction to the current transaction.
+
+Must be called while in an active transaction. Allows you to
+link multiple related transactions (many-to-many relationship)."
+  (interactive)
+  (unless claude-code-log--transaction-id
+    (error "Not in a transaction. Use `claude-code-record' first"))
+
+  (let* ((candidates (claude-code-log--get-transaction-candidates nil 20))
+         (selected (completing-read "Related transaction: "
+                                   candidates
+                                   nil nil nil
+                                   'claude-code-log--parent-history))
+         (related-id (cdr (assoc selected candidates))))
+
+    ;; Add to list if not already present
+    (unless (member related-id claude-code-log--related-transactions)
+      (push related-id claude-code-log--related-transactions)
+      (message "Added related transaction: %s" related-id))))
+
+;;;###autoload
+(defun claude-code-log-search-transactions ()
+  "Search all transactions by description, command, or project.
+
+Uses consult/vertico for rich filtering. Search across all projects
+and navigate transaction history."
+  (interactive)
+  (let* ((all-candidates (claude-code-log--get-all-transaction-candidates))
+         (selected (if all-candidates
+                       (completing-read "Search transactions: " all-candidates)
+                     (error "No transactions found")))
+         (txn-id (cdr (assoc selected all-candidates)))
+         (project (claude-code-log--get-project-from-txn-id txn-id))
+         (log-file (claude-code-log--get-log-file project txn-id 'transactional)))
+
+    ;; Open transaction log in view mode
+    (if (file-exists-p log-file)
+        (progn
+          (find-file-read-only log-file)
+          (message "Viewing transaction: %s" txn-id))
+      (message "Log file not found: %s" log-file))))
+
+(defun claude-code-log--get-project-from-txn-id (txn-id)
+  "Get project name from TXN-ID by searching metadata files."
+  (let ((projects-dir (expand-file-name "projects" claude-code-log-corpus-dir))
+        (found-project nil))
+    (when (file-directory-p projects-dir)
+      (dolist (project-dir (directory-files projects-dir t "^[^.]"))
+        (when (and (file-directory-p project-dir) (not found-project))
+          (let* ((project-name (file-name-nondirectory project-dir))
+                 (version-dir (claude-code-log--get-version-dir project-name))
+                 (metadata-file (expand-file-name
+                                 (format "%s.json" txn-id)
+                                 (expand-file-name "metadata" version-dir))))
+            (when (file-exists-p metadata-file)
+              (setq found-project project-name))))))
+    (or found-project "unclassified")))
 
 ;;;; Installation
 
