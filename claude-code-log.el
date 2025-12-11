@@ -27,6 +27,7 @@
 (require 'claude-code)
 (require 'project)
 (require 'json)
+(require 'cl-lib)
 
 ;;;; Customization
 
@@ -123,6 +124,31 @@ Use `claude-code-log' for user-facing control.")
 
 (defvar claude-code-log--parent-history nil
   "History for parent transaction selection.")
+
+;;;; Mode Line Indicator
+
+(defvar-local claude-code-log--mode-line-indicator nil
+  "Mode line indicator for transaction status.")
+
+(defun claude-code-log--update-mode-line ()
+  "Update mode line indicator based on transaction state."
+  (setq claude-code-log--mode-line-indicator
+        (when claude-code-log--transaction-id
+          (let* ((cmd-count (or claude-code-log--command-count 0))
+                 (has-parent (not (null claude-code-log--parent-transaction)))
+                 (indicator-text (format " [TXN:%d%s]"
+                                       cmd-count
+                                       (if has-parent "→" ""))))
+            (propertize indicator-text
+                       'face 'success
+                       'help-echo (format "Transaction: %s\nCommands: %d%s"
+                                         claude-code-log--transaction-id
+                                         cmd-count
+                                         (if has-parent
+                                             (format "\nLinked to: %s"
+                                                    claude-code-log--parent-transaction)
+                                           ""))))))
+  (force-mode-line-update))
 
 ;;;; Utility Functions
 
@@ -654,14 +680,20 @@ The transaction continues until you call `claude-code-commit'."
       (setq claude-code-log--transaction-id txn-id
             claude-code-log--baseline-sha git-sha
             claude-code-log--baseline-timestamp (float-time)
+            ;; Save current buffer size - we'll capture everything from here onward
             claude-code-log--baseline-buffer-point (point-max)
             claude-code-log--baseline-dirty-files (when claude-code-log--artifact-tracking
                                                     (claude-code-log--get-dirty-files))
             claude-code-log--tool-uses '()
-            claude-code-log--command-count 0)
+            claude-code-log--command-count 0
+            ;; Clear any previous first command
+            claude-code-log--first-command nil)
 
       ;; Write transaction start marker
       (claude-code-log--write-transaction-start project txn-id (buffer-name) git-sha)
+
+      ;; Update mode line indicator
+      (claude-code-log--update-mode-line)
 
       (message "Transaction started: %s" txn-id))))
 
@@ -698,9 +730,25 @@ The data is written to the corpus directory for later curation."
       (setq claude-code-log--description description))
 
     ;; Capture conversation snapshot
-    (let ((conversation (buffer-substring-no-properties
-                         claude-code-log--baseline-buffer-point
-                         (point-max))))
+    ;; Handle case where buffer may have shrunk (terminal scrollback)
+    (let* ((start-point claude-code-log--baseline-buffer-point)
+           (end-point (point-max))
+           (conversation (cond
+                         ;; Buffer shrunk or start point invalid - capture entire buffer
+                         ((or (not start-point)
+                              (>= start-point end-point)
+                              (> start-point (point-max)))
+                          (progn
+                            (message "Warning: Buffer changed size, capturing entire buffer")
+                            (buffer-substring-no-properties (point-min) (point-max))))
+                         ;; Normal case - capture from baseline to end
+                         (t
+                          (buffer-substring-no-properties start-point end-point)))))
+      ;; Debug: log snapshot details
+      (message "Snapshot: start=%s end=%s length=%d chars"
+               (if (and start-point (<= start-point end-point)) start-point "FULL")
+               end-point
+               (length conversation))
       (claude-code-log--write-conversation-snapshot project txn-id conversation))
 
     ;; Detect and write artifacts
@@ -759,6 +807,9 @@ The data is written to the corpus directory for later curation."
             claude-code-log--related-transactions nil
             claude-code-log--first-command nil)
 
+      ;; Update mode line indicator (clear it)
+      (claude-code-log--update-mode-line)
+
       (message "Transaction committed: %s (%d artifacts, %dm%ds)"
                txn-id artifact-count (/ duration 60) (mod duration 60)))))
 
@@ -810,7 +861,133 @@ conversation log."
       ;; Write continuation marker
       (claude-code-log--write-continuation-marker project last-txn-id)
 
+      ;; Update mode line indicator
+      (claude-code-log--update-mode-line)
+
       (message "Reopened transaction: %s (continue working, commit when done)" last-txn-id))))
+
+;;;###autoload
+(defun claude-code-log-cancel ()
+  "Cancel the current transaction without committing.
+
+This command aborts an ongoing transaction and clears all transaction state.
+The log file created for the transaction is deleted, and no metadata is saved.
+Use this when you want to discard a recording session without keeping any data.
+
+If you want to keep the data, use `claude-code-commit' instead."
+  (interactive)
+  (unless claude-code-log--transaction-id
+    (error "Not in a transaction. Nothing to cancel"))
+
+  (let* ((project (claude-code-log--get-project-name))
+         (txn-id claude-code-log--transaction-id)
+         (log-file (claude-code-log--get-log-file project txn-id 'transactional)))
+
+    ;; Confirm cancellation
+    (when (yes-or-no-p (format "Cancel transaction %s? (log file will be deleted) " txn-id))
+      ;; Delete log file if it exists
+      (when (file-exists-p log-file)
+        (delete-file log-file)
+        (message "Deleted log file: %s" log-file))
+
+      ;; Clear transaction state
+      (setq claude-code-log--transaction-id nil
+            claude-code-log--baseline-sha nil
+            claude-code-log--baseline-timestamp nil
+            claude-code-log--baseline-buffer-point nil
+            claude-code-log--baseline-dirty-files nil
+            claude-code-log--tool-uses nil
+            claude-code-log--command-count 0
+            claude-code-log--description nil
+            claude-code-log--parent-transaction nil
+            claude-code-log--relationship-type nil
+            claude-code-log--related-transactions nil
+            claude-code-log--first-command nil)
+
+      ;; Update mode line indicator (clear it)
+      (claude-code-log--update-mode-line)
+
+      (message "Transaction cancelled: %s" txn-id))))
+
+;;;###autoload
+(defun claude-code-log-sync ()
+  "Synchronize transaction state with log file.
+
+This command reads the current transaction log file and updates
+the in-memory state to match the file contents. Useful if you've
+manually edited the log file or if state has become inconsistent.
+
+If the log file doesn't exist, the transaction is cleared (treated
+as canceled). If not in a transaction, this command does nothing."
+  (interactive)
+  (unless claude-code-log--transaction-id
+    (message "Not in a transaction. Nothing to sync")
+    (cl-return-from claude-code-log-sync))
+
+  (let* ((project (claude-code-log--get-project-name))
+         (txn-id claude-code-log--transaction-id)
+         (log-file (claude-code-log--get-log-file project txn-id 'transactional)))
+
+    (if (not (file-exists-p log-file))
+        ;; Log file doesn't exist - clear transaction
+        (progn
+          (message "Log file missing for transaction %s. Clearing transaction state." txn-id)
+          (setq claude-code-log--transaction-id nil
+                claude-code-log--baseline-sha nil
+                claude-code-log--baseline-timestamp nil
+                claude-code-log--baseline-buffer-point nil
+                claude-code-log--baseline-dirty-files nil
+                claude-code-log--tool-uses nil
+                claude-code-log--command-count 0
+                claude-code-log--description nil
+                claude-code-log--parent-transaction nil
+                claude-code-log--relationship-type nil
+                claude-code-log--related-transactions nil
+                claude-code-log--first-command nil)
+          (claude-code-log--update-mode-line))
+
+      ;; Log file exists - parse and sync
+      (let ((command-count 0)
+            (tool-uses '())
+            (first-command nil))
+        (with-temp-buffer
+          (insert-file-contents log-file)
+          (goto-char (point-min))
+
+          ;; Count USER-COMMAND markers and capture first command
+          (while (re-search-forward "^>>> USER-COMMAND |" nil t)
+            (setq command-count (1+ command-count))
+            ;; Capture first command text
+            (when (= command-count 1)
+              (forward-line 1)
+              (let ((cmd-start (point))
+                    (cmd-end (or (save-excursion
+                                   (re-search-forward "^\\(>>>\\|;;;\\)" nil t)
+                                   (line-beginning-position))
+                                 (point-max))))
+                (setq first-command
+                      (string-trim (buffer-substring-no-properties cmd-start cmd-end))))))
+
+          ;; Extract TOOL-USE markers
+          (goto-char (point-min))
+          (while (re-search-forward "^;;; TOOL-USE: \\([^ ]+\\) | \\([^\n]+\\)" nil t)
+            (let ((tool-name (match-string 1))
+                  (timestamp (match-string 2)))
+              (push `((type . pre-tool-use)
+                      (tool . ,tool-name)
+                      (timestamp . ,timestamp))
+                    tool-uses))))
+
+        ;; Update state
+        (setq claude-code-log--command-count command-count
+              claude-code-log--tool-uses (nreverse tool-uses)
+              claude-code-log--first-command first-command)
+
+        ;; Update mode line
+        (claude-code-log--update-mode-line)
+
+        (message "Transaction %s synced: %d commands, %d tool uses"
+                 txn-id command-count (length tool-uses))))))
 
 ;;;; Event Hook Integration
 
@@ -880,7 +1057,9 @@ CMD is the command string."
               (1+ claude-code-log--command-count))
         ;; Capture first command for description generation
         (unless claude-code-log--first-command
-          (setq claude-code-log--first-command cmd)))))
+          (setq claude-code-log--first-command cmd))
+        ;; Update mode line indicator
+        (claude-code-log--update-mode-line))))
 
   ;; Call original function
   (funcall orig-fun cmd))
@@ -915,6 +1094,9 @@ feature evolution and related work."
     (setq-local claude-code-log--parent-transaction parent-id
                 claude-code-log--relationship-type relationship)
 
+    ;; Update mode line indicator
+    (claude-code-log--update-mode-line)
+
     (message "Transaction started with parent: %s (%s)" parent-id relationship)))
 
 ;;;###autoload
@@ -945,6 +1127,9 @@ establish a parent relationship after starting the transaction."
 
     (setq-local claude-code-log--parent-transaction parent-id
                 claude-code-log--relationship-type relationship)
+
+    ;; Update mode line indicator
+    (claude-code-log--update-mode-line)
 
     (message "Linked to parent: %s (%s)" parent-id relationship)))
 
@@ -1010,6 +1195,12 @@ and navigate transaction history."
 
 ;;;; Installation
 
+(defun claude-code-log--setup-mode-line ()
+  "Add mode line indicator to current Claude Code buffer."
+  (unless (member 'claude-code-log--mode-line-indicator mode-line-format)
+    (setq mode-line-format
+          (append mode-line-format '(claude-code-log--mode-line-indicator)))))
+
 ;;;###autoload
 (defun claude-code-log-enable ()
   "Enable Claude Code logging system."
@@ -1017,6 +1208,13 @@ and navigate transaction history."
   (advice-add 'claude-code--do-send-command
               :around #'claude-code-log--wrap-send-command)
   (add-hook 'claude-code-event-hook #'claude-code-log--event-listener)
+  (add-hook 'claude-code-start-hook #'claude-code-log--setup-mode-line)
+  ;; Add mode line indicator to existing Claude Code buffers
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'eat-mode)
+                 (string-match-p "\\*claude:" (buffer-name)))
+        (claude-code-log--setup-mode-line))))
   (message "Claude Code logging enabled"))
 
 ;;;###autoload
@@ -1026,6 +1224,7 @@ and navigate transaction history."
   (advice-remove 'claude-code--do-send-command
                  #'claude-code-log--wrap-send-command)
   (remove-hook 'claude-code-event-hook #'claude-code-log--event-listener)
+  (remove-hook 'claude-code-start-hook #'claude-code-log--setup-mode-line)
   (message "Claude Code logging disabled"))
 
 (provide 'claude-code-log)
